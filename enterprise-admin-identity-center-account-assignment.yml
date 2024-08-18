@@ -1,0 +1,352 @@
+################################################################################################
+#  Copyright © Amazon.com and Affiliates:                                                      #
+#                                                                                              #
+#  This deliverable is considered Developed Content as defined in the AWS Service Terms and    #
+#  the SOW between the parties dated June 29, 2023.                                            #
+################################################################################################
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Deploys Custom Lambda Function for Automating Enterprise Administrator Identity Center Account Assignment
+
+Metadata:
+  Version: "1.1"
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Identity Center Parameters
+        Parameters:
+          - pIdentityCenterInstanceArn
+          - pPermissionSetArn
+          - pPermissionSetGroupId
+      - Label:
+          default: Notification Parameters
+        Parameters:
+          - pEmailEndPoint
+          - pKeyAliasPrefix
+
+    ParameterLabels:
+      pIdentityCenterInstanceArn:
+        default: Identity Center Instance ARN
+      pPermissionSetArn:
+        default: Permission Set ARN
+      pPermissionSetGroupId:
+        default: Permission Set Group ID
+      pEmailEndPoint:
+        default: Email Endpoint (Address)
+      pKeyAliasPrefix:
+        default: KMS Key Alias Prefix
+
+Parameters:
+  pIdentityCenterInstanceArn:
+    Type: String
+    Description: The ARN of the Identity Center Instance
+    AllowedPattern: ^arn:(aws|aws-us-gov):sso:::instance\/(sso)?ins-[a-zA-Z0-9-.]{16}$
+
+  pPermissionSetArn:
+    Type: String
+    Description: The ARN of the Enterprise Admin Permission Set
+    AllowedPattern: ^arn:(aws|aws-us-gov):sso:::permissionSet\/(sso)?ins-[a-zA-Z0-9-.]{16}\/ps-[a-f0-9]+$
+
+  pPermissionSetGroupId:
+    Type: String
+    Description: The ID of the Enterprise Administrator Group
+    AllowedPattern: ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+
+  pEmailEndPoint:
+    Type: String
+    AllowedPattern: ^\S+@us\.navy\.mil$
+    Description: >-
+      (Required) The Email endpoint that receives notifications from the SNS topic for Identity Center Account Assignment.
+      A valid email address ends in @us.navy.mil. More endpoints can be added later, directly via the SNS console.
+
+  pKeyAliasPrefix:
+    Type: String
+    Default: dc2hs
+    AllowedValues:
+      - dc2hs
+    Description: (Read-only) Identifies the prefix added to key aliases when customer managed KMS keys are used.
+
+Resources:
+  rEntAdminIdentityCenterAccountAssignmentNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: EntAdmin-IdentityCenter-Account-Assignment
+      DisplayName: EntAdmin-IdentityCenter-Account-Assignment
+      KmsMasterKeyId: !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/${pKeyAliasPrefix}-sns
+
+  rEntAdminIdentityCenterAccountAssignmentNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref rEntAdminIdentityCenterAccountAssignmentNotificationTopic
+      Protocol: email
+      Endpoint: !Ref pEmailEndPoint
+
+  rEntAdminIdentityCenterAccountAssignmentFailureNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: EntAdmin-IdentityCenter-Account-Failure-Notification
+      DisplayName: EntAdmin-IdentityCenter-Account-Failure-Notification
+      KmsMasterKeyId: !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/${pKeyAliasPrefix}-sns
+
+  rEntAdminIdentityCenterAccountAssignmentFailureNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref rEntAdminIdentityCenterAccountAssignmentFailureNotificationTopic
+      Protocol: email
+      Endpoint: !Ref pEmailEndPoint
+
+  rNewAccountAddedInOrgBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: EventBridge rule for new accounts that accepted invitation into Organizations.
+      EventPattern:
+        source:
+          - aws.organizations
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - AcceptHandshake
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt rEntAdminIdentityCenterAccountAssignmentLambda.Arn
+          Id: EntAdmin-IdentityCenter-Account-Assignment
+
+  rEntAdminIdentityCenterAccountAssignmentLambdaPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: EntAdmin-IdentityCenter-Account-Assignment
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt rNewAccountAddedInOrgBridgeRule.Arn
+
+  rEntAdminIdentityCenterAccountAssignmentCloudWatchLogsKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: KMS Key used to encrypt the Log Groups used for Enterprise Admin Identity Center Account Assignment function
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: logs-kms-key
+        Statement:
+          - Sid: Allow administration of the key via IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            NotAction:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+            Resource: "*"
+          - Sid: Allow logs service principal to use the key
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/EntAdmin-IdentityCenter-Account-Assignment
+
+  rEntAdminIdentityCenterAccountAssignmentLambdaLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/lambda/EntAdmin-IdentityCenter-Account-Assignment
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt rEntAdminIdentityCenterAccountAssignmentCloudWatchLogsKmsKey.Arn
+
+  rEntAdminIdentityCenterAccountAssignmentRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11 # IAM role should not allow * resource on its permissions policy
+            reason: Permissions are scoped down using Conditions
+    Properties:
+      Description: Do Not Modify or Delete
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EntAdminIdentityCenterAccountAssignmentSNSPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowPublishToSnsTopic
+                Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  - !Ref rEntAdminIdentityCenterAccountAssignmentNotificationTopic
+                  - !Ref rEntAdminIdentityCenterAccountAssignmentFailureNotificationTopic
+        - PolicyName: EntAdminIdentityCenterAccountAssignmentKMSPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowCryptographicOperationsForKMSKey
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:CallerAccount: !Ref AWS::AccountId
+                    kms:ViaService: !Sub sns.${AWS::Region}.amazonaws.com
+                  StringLike:
+                    kms:EncryptionContext:aws:sns:topicArn:
+                      - !Ref rEntAdminIdentityCenterAccountAssignmentNotificationTopic
+                      - !Ref rEntAdminIdentityCenterAccountAssignmentFailureNotificationTopic
+                  ForAnyValue:StringEquals:
+                    kms:ResourceAliases: !Sub alias/${pKeyAliasPrefix}-sns
+        - PolicyName: EntAdminIdentityCenterAccountAssignmentOrgPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowDescribeAccounts
+                Effect: Allow
+                Action: organizations:DescribeAccount
+                Resource: "*"
+        - PolicyName: EntAdminIdentityCenterAccountAssignmentSSOPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowCreateAccountAssignment
+                Effect: Allow
+                Action: sso:CreateAccountAssignment
+                Resource:
+                  - !Ref pPermissionSetArn
+                  - !Ref pIdentityCenterInstanceArn
+                  - !Sub arn:${AWS::Partition}:sso:::account/*
+
+  rEntAdminIdentityCenterAccountAssignmentLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58 # Lambda functions require permission to write CloudWatch Logs
+            reason: The managed policy, AWSLambdaBasicExecutionRole, attached to the execution role includes permissions to write to CloudWatch Logs
+          - id: W89 # Lambda functions should be deployed inside a VPC
+            reason: This function does not access any private resources within a VPC, and there is no VPC Endpoint for IAM
+      checkov:
+        skip:
+          - id: CKV_AWS_117 # Ensure that AWS Lambda function is configured inside a VPC
+            comment: This function does not access any private resources within a VPC
+          - id: CKV_AWS_173 # Check encryption settings for Lambda environmental variable
+            comment: Lambda environmental variable does not contain sensitive information
+    DependsOn: rEntAdminIdentityCenterAccountAssignmentLambdaLogs
+    Properties:
+      FunctionName: EntAdmin-IdentityCenter-Account-Assignment
+      Description: Do Not Modify or Delete! This function grants the Enterprise Admin Group access to New MO accounts in Identity Center
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      MemorySize: 256
+      ReservedConcurrentExecutions: 3
+      Role: !GetAtt rEntAdminIdentityCenterAccountAssignmentRole.Arn
+      Environment:
+        Variables:
+          instance_arn: !Ref pIdentityCenterInstanceArn
+          permission_set_arn: !Ref pPermissionSetArn
+          permission_set_group_id: !Ref pPermissionSetGroupId
+          sns_arn: !Ref rEntAdminIdentityCenterAccountAssignmentNotificationTopic
+      DeadLetterConfig:
+        TargetArn: !Ref rEntAdminIdentityCenterAccountAssignmentFailureNotificationTopic
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          organizations_client = boto3.client('organizations')
+          sso_admin_client = boto3.client('sso-admin')
+          sns_client = boto3.client('sns')
+          SNS_ARN = os.environ['sns_arn']
+          INSTANCE_ARN = os.environ['instance_arn']
+          PERM_SET_ARN = os.environ['permission_set_arn']
+          PERM_SET_GROUP_ID = os.environ['permission_set_group_id']
+
+          def lambda_handler(event, context):
+              logger.info(f'Event: {json.dumps(event, default=str)}')
+              parties = event['detail']['responseElements']['handshake']['parties']
+              account_ids = [party['id'] for party in parties if party['type'] == 'ACCOUNT']
+              account_id = account_ids[0]
+              logger.info(account_id)
+              account_name = get_account_name(account_id)
+              sso_account_assignment(account_id, account_name)
+              message = get_message(context, account_id, account_name)
+              send_message(message)
+
+          def get_account_name(account_id):
+              try:
+                  account_name = ''
+                  response = organizations_client.describe_account(AccountId=account_id)
+                  account_name = response['Account']['Name']
+                  logger.info(account_name)
+              except ClientError as e:
+                  logger.info(f'Error getting account name for account ({account_id}): {e}')
+
+              return account_name
+
+          def sso_account_assignment(account_id, account_name):
+              try:
+                  # Create an account assignment
+                  sso_admin_client.create_account_assignment(
+                      InstanceArn=INSTANCE_ARN,
+                      TargetId=account_id,
+                      TargetType='AWS_ACCOUNT',
+                      PermissionSetArn=PERM_SET_ARN,
+                      PrincipalType='GROUP',
+                      PrincipalId=PERM_SET_GROUP_ID
+                  )
+                  logger.info(f'Account assignment created for AccountId: {account_id}, Account Name: {account_name}')
+              except ClientError as e:
+                  logger.info(f'Error creating account assignment for AccountId: {account_id}, Account Name: {account_name}: {e}')
+                  raise e
+
+          def get_message(context, account_id, account_name):
+              # Format SNS Message Function
+              message = f"An Identity Center Account Assignment was created for Enterprise Administrators in {account_id} ({account_name}). \n\n\n"
+              message += "This notification was generated by AWS Lambda Function. " + context.invoked_function_arn
+              return message
+
+          def send_message(message):
+              # Send SNS Publish Function
+              try:
+                  sns_client.publish(
+                      TopicArn=SNS_ARN,
+                      Message= message,
+                      Subject="New Identity Center Account Assignment Created."
+                  )
+                  logger.info(f'Account assignment was successful, message published to SNS: {message}')
+              except ClientError as e:
+                  logger.info(f'Account assignment was successful, but encountered error publishing message to SNS: {e}')
+                  raise e
